@@ -1271,39 +1271,19 @@ func (r *ProtocolIncus) ExecInstance(instanceName string, exec api.InstanceExecP
 		}
 	}
 
-	if fds[api.SecretNameControl] != "" {
-		if exec.Interactive {
-			// Synchronous: Block and surface errors.
-			conn, err := r.GetOperationWebsocket(opAPI.ID, fds[api.SecretNameControl])
-			if err != nil {
-				return nil, err
-			}
+	if fds[api.SecretNameControl] != "" && exec.Interactive {
+		conn, err := r.GetOperationWebsocket(opAPI.ID, fds[api.SecretNameControl])
+		if err != nil {
+			return nil, err
+		}
 
-			go func() {
-				_, _, _ = conn.ReadMessage() // Consume pings from server.
-			}()
+		go func() {
+			_, _, _ = conn.ReadMessage() // Consume pings from server.
+		}()
 
-			if args.Control != nil {
-				// Call the control handler with a connection to the control socket
-				go args.Control(conn)
-			}
-		} else {
-			// Connect control asynchronously so it cannot delay data channels.
-			go func() {
-				conn, err := r.GetOperationWebsocket(opAPI.ID, fds[api.SecretNameControl])
-				if err != nil {
-					// Optional in non-interactive; ignore failure.
-					return
-				}
-
-				go func() {
-					_, _, _ = conn.ReadMessage() // Consume pings from server.
-				}()
-
-				if args.Control != nil {
-					go args.Control(conn)
-				}
-			}()
+		if args.Control != nil {
+			// Call the control handler with a connection to the control socket
+			go args.Control(conn)
 		}
 	}
 
@@ -1332,7 +1312,7 @@ func (r *ProtocolIncus) ExecInstance(instanceName string, exec api.InstanceExecP
 			}
 		}
 	} else {
-		// Non‑interactive: attach data websockets without delay and start mirrors after attach.
+		// Non‑interactive: attach required websockets concurrently and start mirrors after attach.
 		dones := make(map[int]chan error)
 		conns := []*websocket.Conn{}
 
@@ -1344,7 +1324,6 @@ func (r *ProtocolIncus) ExecInstance(instanceName string, exec api.InstanceExecP
 			args.Stderr = io.Discard
 		}
 
-		// Attach 0/1/2 concurrently to eliminate attach gap.
 		type wsAttachResult struct {
 			name string
 			conn *websocket.Conn
@@ -1352,6 +1331,9 @@ func (r *ProtocolIncus) ExecInstance(instanceName string, exec api.InstanceExecP
 		}
 
 		attachNames := []string{}
+		if fds[api.SecretNameControl] != "" {
+			attachNames = append(attachNames, api.SecretNameControl)
+		}
 		if fds["0"] != "" {
 			attachNames = append(attachNames, "0")
 		}
@@ -1362,12 +1344,15 @@ func (r *ProtocolIncus) ExecInstance(instanceName string, exec api.InstanceExecP
 			attachNames = append(attachNames, "2")
 		}
 
+		var controlConn *websocket.Conn
 		var stdinConn *websocket.Conn
 		var stdoutConn *websocket.Conn
 		var stderrConn *websocket.Conn
 
 		if len(attachNames) > 0 {
 			resCh := make(chan wsAttachResult, len(attachNames))
+
+			// Spawn concurrent attaches.
 			for _, name := range attachNames {
 				secret := fds[name]
 				go func(n string, s string) {
@@ -1376,10 +1361,14 @@ func (r *ProtocolIncus) ExecInstance(instanceName string, exec api.InstanceExecP
 				}(name, secret)
 			}
 
+			// Collect results; any failure is fatal. Close any successful sockets on failure.
 			for i := 0; i < len(attachNames); i++ {
 				res := <-resCh
 				if res.err != nil {
 					// Close any successful sockets.
+					if controlConn != nil {
+						_ = controlConn.Close()
+					}
 					if stdinConn != nil {
 						_ = stdinConn.Close()
 					}
@@ -1393,6 +1382,8 @@ func (r *ProtocolIncus) ExecInstance(instanceName string, exec api.InstanceExecP
 				}
 
 				switch res.name {
+				case api.SecretNameControl:
+					controlConn = res.conn
 				case "0":
 					stdinConn = res.conn
 				case "1":
@@ -1403,10 +1394,21 @@ func (r *ProtocolIncus) ExecInstance(instanceName string, exec api.InstanceExecP
 			}
 		}
 
+		// Control is required by wait-for-websocket=true; if present in fds but failed to connect above,
+		// we'd have returned an error already. If connected, consume pings and run handler.
+		if controlConn != nil {
+			go func() {
+				_, _, _ = controlConn.ReadMessage()
+			}()
+			if args.Control != nil {
+				go args.Control(controlConn)
+			}
+		}
+
 		// Consume pings on stdin and build conns in fixed order for existing indexing.
 		if stdinConn != nil {
 			go func() {
-				_, _, _ = stdinConn.ReadMessage() // Consume pings from server.
+				_, _, _ = stdinConn.ReadMessage()
 			}()
 			conns = append(conns, stdinConn)
 			dones[0] = ws.MirrorRead(stdinConn, args.Stdin)
@@ -1414,8 +1416,7 @@ func (r *ProtocolIncus) ExecInstance(instanceName string, exec api.InstanceExecP
 
 		waitConns := 0 // Used for keeping track of when stdout and stderr have finished.
 
-		// Start output mirrors only after both sockets are attached.
-		// Append stdout and stderr into conns in deterministic order and start mirrors.
+		// Start output mirrors only after both sockets are attached (when present), preserving order.
 		if stdoutConn != nil {
 			conns = append(conns, stdoutConn)
 			dones[1] = ws.MirrorWrite(stdoutConn, args.Stdout)
@@ -1432,8 +1433,7 @@ func (r *ProtocolIncus) ExecInstance(instanceName string, exec api.InstanceExecP
 			for {
 				select {
 				case <-dones[0]:
-					// Handle stdin finish, but don't wait for it if output channels
-					// have all finished.
+					// Handle stdin finish.
 					dones[0] = nil
 					_ = conns[0].Close()
 				case <-dones[1]:
@@ -1449,7 +1449,7 @@ func (r *ProtocolIncus) ExecInstance(instanceName string, exec api.InstanceExecP
 				if waitConns <= 0 {
 					// Close stdin websocket if defined and not already closed.
 					if dones[0] != nil {
-						conns[0].Close()
+						_ = conns[0].Close()
 					}
 
 					break
